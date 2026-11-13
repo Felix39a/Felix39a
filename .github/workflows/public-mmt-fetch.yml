@@ -1,0 +1,89 @@
+name: Public MMT archive acquisition
+on:
+  push:
+    paths:
+      - '.github/workflows/public-mmt-fetch.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fetch-public-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install public-data readers
+        run: python -m pip install --disable-pip-version-check requests pyarrow
+      - name: Download immutable archive and retain published target cohort
+        shell: bash
+        run: |
+          mkdir -p public-data/shards public-data/wheels
+          cat > /tmp/fetch.py <<'PY'
+          import hashlib,json,time,os
+          from pathlib import Path
+          import requests
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+          import pyarrow as pa
+          import pyarrow.compute as pc
+          import pyarrow.parquet as pq
+          R=Path('public-data')
+          revision='2e2194c608897a420bafa61b8d14fd56130a55de'
+          ids=[16908,1726,3307,25770,25963,25852,25851,26857,26997,8197,13492,10664,163,192,271,574,622,6235,2403,2481,25416,40091,36588,35937,35938,37818,38744,22076,38258,22079,26858,28385,29517,40750,14096,36120,7647,37253,16910,22196,25868,8352,25484,447,2255,7688,20344,7028,53,8311]
+          assert len(ids)==len(set(ids))==50
+          sess=requests.Session();sess.mount('https://',HTTPAdapter(max_retries=Retry(total=5,backoff_factor=2,status_forcelist=[429,500,502,503,504])))
+          api=f'https://huggingface.co/api/datasets/kyselica/MMT_snapshot/revision/{revision}'
+          r=sess.get(api,timeout=90);r.raise_for_status();info=r.json();assert info['sha']==revision
+          (R/'snapshot_metadata.json').write_text(json.dumps(info,indent=2))
+          (R/'published_target_ids.json').write_text(json.dumps({'source':'Li et al., Acta Astronautica 240 (2026), Table 3, doi:10.1016/j.actaastro.2025.12.001','ids':ids,'not_original_SOLID50_release':True},indent=2))
+          paths=[v['rfilename'] for v in info['siblings'] if v['rfilename'].endswith('.parquet')]
+          assert paths
+          record=[];total=0;found=set()
+          for i,path in enumerate(paths):
+            f=Path('/tmp/current.parquet')
+            url=f'https://huggingface.co/datasets/kyselica/MMT_snapshot/resolve/{revision}/{path}?download=true&refresh={int(time.time())}'
+            h=hashlib.sha256();size=0
+            with sess.get(url,stream=True,timeout=(30,300)) as response:
+              response.raise_for_status()
+              with f.open('wb') as out:
+                for b in response.iter_content(4*1024*1024):
+                  if b:out.write(b);h.update(b);size+=len(b)
+            table=pq.read_table(f)
+            if 'norad_id' not in table.column_names:raise RuntimeError('Unexpected schema: '+str(table.schema))
+            selected=table.filter(pc.is_in(pc.cast(table['norad_id'],pa.int64()),value_set=pa.array(ids,type=pa.int64())))
+            name=f'{i:03d}_'+Path(path).name
+            pq.write_table(selected,R/'shards'/name,compression='zstd',compression_level=9)
+            found.update(selected['norad_id'].to_pylist());total+=selected.num_rows
+            entry={'source':path,'source_bytes':size,'source_sha256':h.hexdigest(),'source_rows':table.num_rows,'selected_rows':selected.num_rows,'output':name}
+            record.append(entry);f.unlink()
+            (R/'acquisition_manifest.json').write_text(json.dumps({'revision':revision,'requested_objects':50,'found_objects':len(found),'missing_ids':sorted(set(ids)-found),'selected_tracks':total,'downloaded_shards':len(record),'expected_shards':len(paths),'complete':False,'shards':record},indent=2))
+            print(json.dumps(entry),flush=True)
+            if sum(x.stat().st_size for x in (R/'shards').glob('*'))>240*1024**2:raise RuntimeError('Artifact budget exceeded; no paid storage expansion requested')
+            del table,selected
+          for path in ['README.md','rso.csv','bulk_idx.txt']:
+            url=f'https://huggingface.co/datasets/kyselica/MMT_snapshot/resolve/{revision}/{path}?download=true&refresh={int(time.time())}'
+            rr=sess.get(url,timeout=90)
+            if rr.status_code==200:(R/path).write_bytes(rr.content)
+          summary={'revision':revision,'requested_objects':50,'found_objects':len(found),'missing_ids':sorted(set(ids)-found),'selected_tracks':total,'downloaded_shards':len(record),'expected_shards':len(paths),'complete':True,'shards':record,'scope':'Measured observations of the 50 public NORAD identities, not the authors SOLID-50 windows or split'}
+          (R/'acquisition_manifest.json').write_text(json.dumps(summary,indent=2));print(json.dumps(summary),flush=True)
+          PY
+          python /tmp/fetch.py
+      - name: Obtain offline-reader wheels
+        run: python -m pip download --no-deps --only-binary=:all: --dest public-data/wheels pyarrow tsfresh==0.21.0 PyWavelets stumpy
+      - name: Check bounded artifact size
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          n=sum(p.stat().st_size for p in Path('public-data').rglob('*') if p.is_file())
+          print('artifact bytes',n)
+          assert n < 300*1024**2, 'Stop rather than increase storage budget'
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-mmt50-observations
+          path: public-data
+          retention-days: 1
+          compression-level: 9
+          if-no-files-found: error
