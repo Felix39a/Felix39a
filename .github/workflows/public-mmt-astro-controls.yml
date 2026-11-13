@@ -1,0 +1,59 @@
+name: Pinned Astroconformer public MMT controls
+on:
+  push:
+    paths: ['.github/workflows/public-mmt-astro-controls.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  astro-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [coarse, identity]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: public-mmt50-observations
+          run-id: 43500174449
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: public-data
+      - name: Install public model and readers
+        run: |
+          python -m pip install numpy pandas pyarrow scikit-learn pyyaml
+          python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+          git clone --quiet https://github.com/kyselica12/Astroconformer.git public-astro
+          cd public-astro && git checkout --quiet 2ae06eb8e9367a02a480b87e77fb1069836c71bb
+      - name: Run the unchanged published control with corrected import path
+        env:
+          TASK: ${{ matrix.task }}
+          MODEL: Astroconformer
+          RATE: '0.001'
+          OMP_NUM_THREADS: '4'
+          OPENBLAS_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '4'
+        run: |
+          python - <<'PY'
+          import yaml,subprocess
+          from pathlib import Path
+          data=yaml.safe_load(Path('.github/workflows/public-mmt-neural-controls.yml').read_text())
+          script=next(s['run'] for s in data['jobs']['published-control']['steps'] if s.get('name')=='Construct the identical public-data cohort and train')
+          old="Path('public-astro').resolve()";new="Path('public-astro/Astroconformer').resolve()"
+          assert old in script
+          subprocess.run(['bash','-e','-c',script.replace(old,new)],check=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-control-Astroconformer-${{ matrix.task }}
+          path: output
+          retention-days: 1
+          compression-level: 9
+          if-no-files-found: warn
