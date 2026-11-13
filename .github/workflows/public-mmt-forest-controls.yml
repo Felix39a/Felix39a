@@ -1,0 +1,70 @@
+name: Published forest controls on public MMT
+on:
+  push:
+    paths: ['.github/workflows/public-mmt-forest-controls.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  forest-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [coarse, identity]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: public-mmt50-observations
+          run-id: 43500174449
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: public-data
+      - name: Install readers
+        run: |
+          python -m pip install numpy pandas pyarrow scikit-learn pyyaml joblib
+          python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+      - name: Build identical measured cohort and train forest
+        env:
+          TASK: ${{ matrix.task }}
+          RATE: '0.001'
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '4'
+        run: |
+          mkdir -p output
+          python - <<'PY'
+          import yaml
+          from pathlib import Path
+          d=yaml.safe_load(Path('.github/workflows/public-cobo-mmt.yml').read_text())
+          step=next(x for x in d['jobs']['published-baseline']['steps'] if x.get('name')=='Run public-data reconstruction and published baseline')
+          script=step['run'].split("cat > /tmp/run.py <<'PY'\n",1)[1].rsplit('\nPY',1)[0]
+          Path('/tmp/forest.py').write_text(script.split('class Model(nn.Module):',1)[0])
+          PY
+          cat >> /tmp/forest.py <<'PY'
+          import joblib
+          from sklearn.ensemble import RandomForestClassifier
+          candidates=[];best=None;t0=time.time()
+          for w in [None,'balanced']:
+            m=RandomForestClassifier(n_estimators=200,max_depth=10,max_features='log2',criterion='entropy',bootstrap=False,class_weight=w,n_jobs=4,random_state=20261114)
+            m.fit(X[tr],y[tr]);p=m.predict_proba(X[va]);score=f1_score(y[va],p.argmax(1),labels=np.arange(C),average='macro',zero_division=0);candidates.append({'class_weight':w,'validation_macro_f1':float(score)})
+            if best is None or score>best[0]:best=(score,m,w,p)
+          score,m,w,p=best;pt=m.predict_proba(X[te]);a,b,c,s=precision_recall_fscore_support(y[te],pt.argmax(1),labels=np.arange(C),zero_division=0)
+          np.savez_compressed(R/'test_predictions.npz',rows=te,y=y[te],probabilities=pt,norad_id=meta.norad_id.to_numpy()[te],track_key=meta.track_key.to_numpy(dtype=str)[te]);np.savez_compressed(R/'validation_predictions.npz',rows=va,y=y[va],probabilities=p)
+          joblib.dump(m,R/'model.joblib',compress=3)
+          result={'model':'Raw-RF (Trummer parameters; validation weight selection)','task':task,'input_length':256,'normalization':'none','candidates':candidates,'selected_class_weight':w,'best_validation_macro_f1':float(score),'test_macro_f1':float(c.mean()),'test_accuracy':float(accuracy_score(y[te],pt.argmax(1))),'class_precision':a.tolist(),'class_recall':b.tolist(),'class_f1':c.tolist(),'seconds':time.time()-t0,'source':'Trummer et al., Acta Astronautica 226 (2025), raw random-forest configuration, no TSFresh; two class-weight settings chosen using validation only'}
+          (R/'result.json').write_text(json.dumps(result,indent=2));(R/'COMPLETE').write_text('completed\n')
+          PY
+          python /tmp/forest.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-control-RawRF-${{ matrix.task }}
+          path: output
+          retention-days: 1
+          compression-level: 9
+          if-no-files-found: warn
