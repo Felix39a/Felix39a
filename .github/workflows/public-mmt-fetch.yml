@@ -71,7 +71,8 @@ jobs:
           PY
           python /tmp/fetch.py
       - name: Obtain offline-reader wheels
-        run: python -m pip download --no-deps --only-binary=:all: --dest public-data/wheels pyarrow tsfresh==0.21.0 PyWavelets stumpy
+        run: |
+          python -m pip download --no-deps --only-binary=:all: --dest public-data/wheels pyarrow tsfresh==0.21.0 PyWavelets stumpy
       - name: Check bounded artifact size
         run: |
           python - <<'PY'
