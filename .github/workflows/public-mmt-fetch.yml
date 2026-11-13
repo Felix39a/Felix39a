@@ -49,7 +49,7 @@ jobs:
             columns=needed+[c for c in ['filter','channel'] if c in names]
             table=source.read(columns=columns)
             selected=table.filter(pc.is_in(pc.cast(table['norad_id'],pa.int64()),value_set=pa.array(ids,type=pa.int64())))
-            name=f'{i:03d}_'+Path(path).name;pq.write_table(selected,R/'shards'/name,compression='zstd',compression_level=12)
+            name=(f'{i:03d}_'+Path(path).name).replace(':','-');pq.write_table(selected,R/'shards'/name,compression='zstd',compression_level=12)
             found.update(selected['norad_id'].to_pylist());total+=selected.num_rows
             entry={'source':path,'source_bytes':size,'source_sha256':h.hexdigest(),'source_rows':table.num_rows,'selected_rows':selected.num_rows,'output':name,'kept_columns':columns,'output_bytes':(R/'shards'/name).stat().st_size}
             record.append(entry);f.unlink()
