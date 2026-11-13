@@ -1,0 +1,133 @@
+name: Published CoBo-LSTM on public MMT
+on:
+  push:
+    paths: ['.github/workflows/public-cobo-mmt.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  published-baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [coarse, identity]
+        learning_rate: ['0.001', '0.01']
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: public-mmt50-observations
+          run-id: 43500174449
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: public-data
+      - name: Install published-model dependencies
+        run: |
+          python -m pip install numpy pandas pyarrow scikit-learn
+          python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+      - name: Run public-data reconstruction and published baseline
+        env:
+          TASK: ${{ matrix.task }}
+          RATE: ${{ matrix.learning_rate }}
+          OMP_NUM_THREADS: '4'
+          OPENBLAS_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '4'
+        run: |
+          mkdir -p output
+          cat > /tmp/run.py <<'PY'
+          import os,time,json,hashlib,random,copy
+          from pathlib import Path
+          from datetime import datetime,timezone
+          import numpy as np,pandas as pd,pyarrow.parquet as pq
+          import torch
+          from torch import nn
+          from torch.nn import functional as F
+          from sklearn.metrics import f1_score,accuracy_score,precision_recall_fscore_support
+          torch.set_num_threads(4);torch.set_num_interop_threads(1)
+          R=Path('output');task=os.environ['TASK'];rate=float(os.environ['RATE']);seed=20261114
+          random.seed(seed);np.random.seed(seed);torch.manual_seed(seed)
+          ids=json.loads(Path('public-data/published_target_ids.json').read_text())['ids'];fine={n:i for i,n in enumerate(sorted(ids))};types={n:(0 if i<29 else 2 if i<47 else 1) for i,n in enumerate(ids)}
+          def epoch(s):
+            d=datetime.fromisoformat(str(s).replace('Z','+00:00'))
+            if d.tzinfo is None:d=d.replace(tzinfo=timezone.utc)
+            return d.timestamp()
+          xs=[];rows=[];times=[];seen=set()
+          for file in sorted(Path('public-data/shards').glob('*.parquet')):
+            table=pq.read_table(file,columns=['norad_id','id','timestamp','time','mag'])
+            for rec in table.to_pylist():
+              nid=int(rec['norad_id']);key=f"{nid}:{rec['id']}";assert key not in seen;seen.add(key)
+              t=np.asarray(rec['time'],np.float64);m=np.asarray(rec['mag'],np.float64);e=epoch(rec['timestamp']);first=float(t[np.isfinite(t)][0]);offset=e-first
+              if any(abs(offset-v)<=.001 for v in [0,3600,7200]):t=t-first
+              else:assert abs(first)<=.001,(first,e)
+              ok=np.isfinite(t)&np.isfinite(m)&(e+t>=epoch('2014-01-01'))&(e+t<epoch('2025-01-01'));t,m=t[ok],m[ok];order=np.argsort(t,kind='stable');t,m=t[order],m[order]
+              cuts=np.r_[0,np.flatnonzero(np.diff(t)>10)+1,len(t)];j=0
+              for a,b in zip(cuts[:-1],cuts[1:]):
+                for q in range(int(a),int(a+(b-a)//256*256),256):
+                  tt=e+t[q:q+256];yy=m[q:q+256].astype(np.float32);rr=(tt-tt[0]).astype(np.float32)
+                  xs.append(yy);times.append(rr);rows.append(dict(sample_id=f'{key}:w{j}',track_key=key,norad_id=nid,identity_label=fine[nid],type_label=types[nid],start_epoch=float(tt[0]),end_epoch=float(tt[-1])));j+=1
+          X=np.stack(xs);T=np.stack(times);del xs,times;meta=pd.DataFrame(rows);meta['split']='unassigned'
+          for nid,sub in meta.groupby('norad_id'):
+            tracks=sub.groupby('track_key').agg(start=('start_epoch','min'),end=('end_epoch','max'),count=('sample_id','size')).sort_values(['start','end'],kind='stable');cohorts=tracks.groupby('start')['count'].sum().sort_index();cum=cohorts.cumsum().to_numpy();n=cum[-1]
+            i1=min(max(int(np.searchsorted(cum,n*.76,side='left'))+1,1),len(cohorts)-2);i2=min(max(int(np.searchsorted(cum,n*.8,side='left'))+1,i1+1),len(cohorts)-1);c1,c2=float(cohorts.index[i1]),float(cohorts.index[i2])
+            for key,z in tracks.iterrows():
+              lo,hi=float(z['start']),float(z['end']);s='train' if hi<c1 else 'validation' if lo>=c1 and hi<c2 else 'test' if lo>=c2 else 'purged_boundary_track';meta.loc[sub.index[sub.track_key==key],'split']=s
+          assert len(X)==90541 and meta.norad_id.nunique()==49
+          present=sorted(meta.norad_id.unique());labels={int(n):i for i,n in enumerate(present)};y=meta.type_label.to_numpy() if task=='coarse' else meta.norad_id.map(labels).to_numpy();C=len(np.unique(y))
+          tr=np.flatnonzero(meta.split=='train');va=np.flatnonzero(meta.split=='validation');te=np.flatnonzero(meta.split=='test')
+          assert len(tr)==69059 and len(va)==3596 and len(te)==17886
+          assert not(set(meta.track_key.iloc[tr])&set(meta.track_key.iloc[te]))
+          fingerprint={'X_sha256':hashlib.sha256(X.tobytes()).hexdigest(),'time_sha256':hashlib.sha256(T.tobytes()).hexdigest(),'type_sha256':hashlib.sha256(meta.type_label.to_numpy(dtype=np.int64).tobytes()).hexdigest(),'track_list_sha256':hashlib.sha256('\n'.join(meta.track_key).encode()).hexdigest(),'rows':len(X),'objects':49,'missing_paper_NORAD':[38258],'task':task,'identity_mapping':labels,'not_original_SOLID50':True,'reconstruction_gap_seconds':10,'split':'per-object whole-track chronological 76/4/20; not author original split'}
+          (R/'data_identity.json').write_text(json.dumps(fingerprint,indent=2));meta.to_csv(R/'sample_manifest.csv',index=False);del T
+          class Model(nn.Module):
+            def __init__(self):
+              super().__init__();rng=np.random.default_rng(seed);choices=[(int(rng.choice([3,5,7,9])),int(rng.choice([1,2,4,8,16]))) for _ in range(128)];self.banks=nn.ModuleList();order=[]
+              for k,d in sorted(set(choices)):
+                ix=[i for i,z in enumerate(choices) if z==(k,d)];self.banks.append(nn.Conv1d(1,len(ix),k,dilation=d,padding=d*(k-1)//2));order+=ix
+              self.register_buffer('inv',torch.tensor(np.argsort(order)));self.rnn=nn.LSTM(1,64,2,batch_first=True,dropout=.2);self.bn=nn.BatchNorm1d(64);self.drop=nn.Dropout(.2);self.fc=nn.Linear(64,C);self.register_buffer('centers',torch.randn(C,64))
+            def forward(self,x):
+              a=torch.cat([c(x[:,None]) for c in self.banks],1)[:,self.inv];rms=(a.square().mean(-1)+1e-8).sqrt();arc=(a[:,:,1:]-a[:,:,:-1]).abs().mean(-1);mid=a[:,:,1:-1];mask=(mid>a[:,:,:-2])&(mid>a[:,:,2:]);mlp=(mid*mask).sum(-1)/mask.sum(-1).clamp_min(1);mx=a.amax(-1);h=torch.stack([rms,arc,mlp,mx],-1).flatten(1).unsqueeze(-1);o,_=self.rnn(h);f=self.bn(o[:,-1]);return self.fc(self.drop(f)),f
+          model=Model();opt=torch.optim.Adam(model.parameters(),lr=rate);scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(opt,mode='min',factor=.5,patience=3)
+          counts=np.bincount(y[tr],minlength=C);alpha=torch.tensor(1-counts/counts.sum(),dtype=torch.float32);Xt=torch.from_numpy(X);yt=torch.tensor(y,dtype=torch.long)
+          def objective(logits,f,yy,update=False):
+            lp=F.log_softmax(logits,-1).gather(1,yy[:,None]).squeeze(1);focal=(-alpha[yy]*(1-lp.exp()).pow(1.8)*lp).mean();center=.5*(f-model.centers[yy].detach()).square().sum(-1).mean();loss=.99*focal+.01*center
+            if update:
+              with torch.no_grad():
+                for c in yy.unique():
+                  mask=yy==c;delta=(model.centers[c]-f[mask]).sum(0)/(1+mask.sum());model.centers[c]-=.5*delta
+            return loss
+          def evaluate(idx):
+            model.eval();pp=[];loss=0.
+            with torch.no_grad():
+              for s in range(0,len(idx),128):
+                ix=idx[s:s+128];logits,f=model(Xt[ix]);loss+=float(objective(logits,f,yt[ix]))*len(ix);pp.append(logits.softmax(-1).numpy())
+            return np.concatenate(pp),loss/len(idx)
+          history=[];best=-1;bestep=0;stale=0;t0=time.time();reason='maximum_epoch_cap';maxep=100
+          for ep in range(1,maxep+1):
+            model.train();order=np.random.permutation(tr);tl=0.;lr=opt.param_groups[0]['lr']
+            for s in range(0,len(order),128):
+              ix=order[s:s+128]
+              if len(ix)<2:continue
+              opt.zero_grad(set_to_none=True);lo,f=model(Xt[ix]);loss=objective(lo,f,yt[ix],True);assert torch.isfinite(loss);loss.backward();nn.utils.clip_grad_norm_(model.parameters(),5);opt.step();tl+=float(loss)*len(ix)
+            pv,vl=evaluate(va);vf=f1_score(y[va],pv.argmax(1),labels=np.arange(C),average='macro',zero_division=0);scheduler.step(vl);history.append({'epoch':ep,'train_loss':tl/len(tr),'val_loss':vl,'val_macro_f1':vf,'lr':lr,'seconds':time.time()-t0});pd.DataFrame(history).to_csv(R/'history.csv',index=False)
+            if vf>best+1e-7:best=vf;bestep=ep;stale=0;torch.save(model.state_dict(),R/'best.pt')
+            else:stale+=1
+            print('epoch',ep,'seconds',round(time.time()-t0),'validation',round(vf,6),flush=True)
+            if ep>=15 and stale>=10:reason='validation_early_stop';break
+          model.load_state_dict(torch.load(R/'best.pt',weights_only=True));pt,_=evaluate(te);pr=pt.argmax(1);a,b,c,s=precision_recall_fscore_support(y[te],pr,labels=np.arange(C),zero_division=0)
+          np.savez_compressed(R/'test_predictions.npz',rows=te,y=y[te],probabilities=pt,norad_id=meta.norad_id.to_numpy()[te],track_key=meta.track_key.to_numpy(dtype=str)[te]);np.savez_compressed(R/'validation_predictions.npz',rows=va,y=y[va],probabilities=evaluate(va)[0])
+          result={'model':'CoBo-LSTM paper-based reconstruction','task':task,'input_length':256,'normalization':'none; source standard magnitude','learning_rate':rate,'best_epoch':bestep,'epochs':len(history),'stopping_reason':reason,'best_validation_macro_f1':best,'test_macro_f1':float(c.mean()),'test_accuracy':float(accuracy_score(y[te],pr)),'class_precision':a.tolist(),'class_recall':b.tolist(),'class_f1':c.tolist(),'parameters':sum(v.numel() for v in model.parameters()),'training_rows':len(tr),'validation_rows':len(va),'test_rows':len(te),'seconds':time.time()-t0,'gamma':1.8,'lambda':.99,'center_step':.5,'kernel_sizes':[3,5,7,9],'dilations':[1,2,4,8,16],'selection':'validation macro-F1; test not used for rate/epoch selection','source':'Li et al., Acta Astronautica 240, 2026, DOI 10.1016/j.actaastro.2025.12.001; unspecified hyperparameters explicitly fixed, not author code'}
+          (R/'result.json').write_text(json.dumps(result,indent=2));(R/'COMPLETE').write_text('completed\n')
+          PY
+          python /tmp/run.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: published-cobo-${{ matrix.task }}-${{ matrix.learning_rate }}
+          path: output
+          retention-days: 1
+          compression-level: 9
+          if-no-files-found: warn
