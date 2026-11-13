@@ -1,0 +1,113 @@
+name: Published neural controls on public MMT
+on:
+  push:
+    paths: ['.github/workflows/public-mmt-neural-controls.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  published-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [TrummerCNN, ResNet20, Astroconformer]
+        task: [coarse, identity]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: public-mmt50-observations
+          run-id: 43500174449
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: public-data
+      - name: Install public model and readers
+        run: |
+          python -m pip install numpy pandas pyarrow scikit-learn pyyaml
+          python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+          git clone --quiet https://github.com/kyselica12/Astroconformer.git public-astro
+          cd public-astro && git checkout --quiet 2ae06eb8e9367a02a480b87e77fb1069836c71bb
+      - name: Construct the identical public-data cohort and train
+        env:
+          TASK: ${{ matrix.task }}
+          MODEL: ${{ matrix.model }}
+          RATE: '0.001'
+          OMP_NUM_THREADS: '4'
+          OPENBLAS_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '4'
+        run: |
+          mkdir -p output
+          python - <<'PY'
+          import yaml
+          from pathlib import Path
+          d=yaml.safe_load(Path('.github/workflows/public-cobo-mmt.yml').read_text())
+          step=next(x for x in d['jobs']['published-baseline']['steps'] if x.get('name')=='Run public-data reconstruction and published baseline')
+          script=step['run'].split("cat > /tmp/run.py <<'PY'\n",1)[1].rsplit('\nPY',1)[0]
+          prefix=script.split('class Model(nn.Module):',1)[0]
+          Path('/tmp/controls.py').write_text(prefix)
+          PY
+          cat >> /tmp/controls.py <<'PY'
+          import sys
+          from types import SimpleNamespace
+          name=os.environ['MODEL']
+          class Basic(nn.Module):
+            def __init__(self,inp,out,stride=1):
+              super().__init__();self.c1=nn.Conv1d(inp,out,3,stride=stride,padding=1,bias=False,padding_mode='circular');self.b1=nn.BatchNorm1d(out);self.c2=nn.Conv1d(out,out,3,padding=1,bias=False,padding_mode='circular');self.b2=nn.BatchNorm1d(out);self.short=nn.Identity() if inp==out and stride==1 else nn.Sequential(nn.Conv1d(inp,out,1,stride=stride,bias=False,padding_mode='circular'),nn.BatchNorm1d(out))
+            def forward(self,x):return F.relu(self.b2(self.c2(F.relu(self.b1(self.c1(x)))))+self.short(x))
+          class ResNet20(nn.Module):
+            def __init__(self):
+              super().__init__();self.head=nn.Sequential(nn.Conv1d(1,16,3,padding=1,bias=False,padding_mode='circular'),nn.BatchNorm1d(16),nn.ReLU());self.blocks=nn.Sequential(Basic(16,16),Basic(16,16),Basic(16,16),Basic(16,32,2),Basic(32,32),Basic(32,32),Basic(32,64,2),Basic(64,64),Basic(64,64));self.fc=nn.Linear(64,C)
+              for m in self.modules():
+                if isinstance(m,(nn.Linear,nn.Conv1d)):nn.init.kaiming_normal_(m.weight)
+            def forward(self,x):return self.fc(self.blocks(self.head(x[:,None])).mean(-1))
+          class TrummerCNN(nn.Module):
+            def __init__(self):
+              super().__init__();self.net=nn.Sequential(nn.Conv1d(1,64,3,padding=1),nn.Tanh(),nn.BatchNorm1d(64),nn.MaxPool1d(2),nn.Conv1d(64,64,3,padding=1),nn.Tanh(),nn.BatchNorm1d(64),nn.MaxPool1d(2),nn.Conv1d(64,64,3,padding=1),nn.Tanh(),nn.BatchNorm1d(64),nn.MaxPool1d(2),nn.AdaptiveAvgPool1d(1));self.fc=nn.Linear(64,C)
+            def forward(self,x):return self.fc(self.net(x[:,None]).squeeze(-1))
+          if name=='Astroconformer':
+            sys.path.insert(0,str(Path('public-astro').resolve()))
+            from Model.models import Astroconformer
+            from Model.utils import deepnorm_init
+            args=SimpleNamespace(in_channels=1,encoder=['mhsa_pro','conv','conv'],timeshift=False,num_layers=5,stride=20,encoder_dim=128,num_heads=8,kernel_size=3,dropout_p=.1,norm='postnorm',deepnorm=True)
+            model=Astroconformer(args);deepnorm_init(model,args);model.pred_layer[-1]=nn.Linear(128,C)
+          else:model={'TrummerCNN':TrummerCNN,'ResNet20':ResNet20}[name]()
+          mean=float(X[tr].mean());std=max(float(X[tr].std()),1e-6);X=(X-mean)/std
+          Xt=torch.from_numpy(X);yt=torch.tensor(y,dtype=torch.long);counts=np.bincount(y[tr],minlength=C);weight=torch.tensor(len(tr)/(C*counts),dtype=torch.float32);lossf=nn.CrossEntropyLoss(weight=weight)
+          opt=torch.optim.Adam(model.parameters(),lr=.001);scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(opt,mode='min',factor=.5,patience=4)
+          def evaluate(idx):
+            model.eval();pp=[];loss=0.
+            with torch.no_grad():
+              for s in range(0,len(idx),256):
+                ix=idx[s:s+256];logits=model(Xt[ix]);loss+=float(F.cross_entropy(logits,yt[ix],reduction='sum'));pp.append(logits.softmax(-1).numpy())
+            return np.concatenate(pp),loss/len(idx)
+          history=[];best=-1;bestep=0;stale=0;t0=time.time();reason='maximum_epoch_cap'
+          for ep in range(1,101):
+            model.train();order=np.random.permutation(tr);tl=0.;lr=opt.param_groups[0]['lr']
+            for s in range(0,len(order),128):
+              ix=order[s:s+128]
+              if len(ix)<2:continue
+              opt.zero_grad(set_to_none=True);logits=model(Xt[ix]);loss=lossf(logits,yt[ix]);assert torch.isfinite(loss);loss.backward();nn.utils.clip_grad_norm_(model.parameters(),5.);opt.step();tl+=float(loss)*len(ix)
+            pv,vl=evaluate(va);vf=f1_score(y[va],pv.argmax(1),labels=np.arange(C),average='macro',zero_division=0);scheduler.step(vl);history.append({'epoch':ep,'train_loss':tl/len(tr),'val_loss':vl,'val_macro_f1':vf,'lr':lr,'seconds':time.time()-t0});pd.DataFrame(history).to_csv(R/'history.csv',index=False)
+            if vf>best+1e-7:best=vf;bestep=ep;stale=0;torch.save(model.state_dict(),R/'best.pt')
+            else:stale+=1
+            print('epoch',ep,'seconds',round(time.time()-t0),'validation',round(vf,6),flush=True)
+            if ep>=15 and stale>=12:reason='validation_early_stop';break
+          model.load_state_dict(torch.load(R/'best.pt',weights_only=True));pt,_=evaluate(te);pr=pt.argmax(1);a,b,c,s=precision_recall_fscore_support(y[te],pr,labels=np.arange(C),zero_division=0)
+          np.savez_compressed(R/'test_predictions.npz',rows=te,y=y[te],probabilities=pt,norad_id=meta.norad_id.to_numpy()[te],track_key=meta.track_key.to_numpy(dtype=str)[te]);np.savez_compressed(R/'validation_predictions.npz',rows=va,y=y[va],probabilities=evaluate(va)[0])
+          result={'model':name,'task':task,'input_length':256,'normalization':'one training-only scalar mean/std, no per-curve amplitude normalization','mean':mean,'std':std,'learning_rate':.001,'best_epoch':bestep,'epochs':len(history),'stopping_reason':reason,'best_validation_macro_f1':best,'test_macro_f1':float(c.mean()),'test_accuracy':float(accuracy_score(y[te],pr)),'class_precision':a.tolist(),'class_recall':b.tolist(),'class_f1':c.tolist(),'parameters':sum(v.numel() for v in model.parameters()),'training_rows':len(tr),'validation_rows':len(va),'test_rows':len(te),'seconds':time.time()-t0,'selection':'validation macro-F1; no test model selection','source':'Declared published-architecture adaptations; Astroconformer fork pinned 2ae06eb8e9367a02a480b87e77fb1069836c71bb; 1D ResNet20 as RoBo6; three-layer Trummer CNN'}
+          (R/'result.json').write_text(json.dumps(result,indent=2));(R/'COMPLETE').write_text('completed\n')
+          PY
+          python /tmp/controls.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-control-${{ matrix.model }}-${{ matrix.task }}
+          path: output
+          retention-days: 1
+          compression-level: 9
+          if-no-files-found: warn
