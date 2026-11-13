@@ -1,0 +1,23 @@
+name: Public scientific readers
+on:
+  push:
+    paths: ['.github/workflows/public-science-readers.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  wheels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: |
+          mkdir -p scientific-readers
+          python -m pip download --no-deps --only-binary=:all: -d scientific-readers astropy pyerfa astropy-iers-data
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-scientific-readers
+          path: scientific-readers
+          retention-days: 1
